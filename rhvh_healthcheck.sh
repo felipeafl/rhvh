@@ -219,6 +219,84 @@ else
     fi
 fi
 
+
+# -----------------------------------------------------------------------------
+# ESTADO Y CONFIGURACION DE VMs
+# -----------------------------------------------------------------------------
+section "ESTADO Y CONFIGURACION DE VMs"
+
+if ! command -v virsh &>/dev/null; then
+    warn "virsh no disponible - omitiendo validacion de VMs"
+else
+    # --- Resumen de estados ---
+    echo -e "  ${BOLD}Resumen de estados:${NC}"
+    TOTAL=$(virsh list --all 2>/dev/null | grep -cE "running|paused|shut off|crashed|pmsuspended")
+    RUNNING=$(virsh list --all 2>/dev/null | grep -c " running")
+    PAUSED=$(virsh list --all 2>/dev/null | grep -c " paused")
+    CRASHED=$(virsh list --all 2>/dev/null | grep -c " crashed")
+    SHUTOFF=$(virsh list --all 2>/dev/null | grep -c "shut off")
+
+    printf "  %-14s %s\n" "Total VMs:"  "$TOTAL"
+    printf "  %-14s %s\n" "Running:"    "$RUNNING"
+    printf "  %-14s %s\n" "Shut off:"   "$SHUTOFF"
+    [ "$PAUSED"  -gt 0 ] && printf "  ${YELLOW}WARNING${NC}  %-10s %s\n" "Paused:"  "$PAUSED"
+    [ "$CRASHED" -gt 0 ] && printf "  ${RED}CRITICAL${NC}  %-10s %s\n" "Crashed:" "$CRASHED"
+    echo ""
+
+    # --- Detalle por VM ---
+    echo -e "  ${BOLD}Detalle por VM:${NC}"
+    printf "  ${BOLD}%-30s %-12s %-6s %-10s %-25s %s${NC}\n" \
+        "NOMBRE" "ESTADO" "vCPUs" "RAM(MiB)" "RED(es)" "SNAPSHOTS"
+    printf "  %.0s-" {1..90}; echo ""
+
+    virsh list --all --name 2>/dev/null | grep -v "^$" | while read VMNAME; do
+        STATE=$(virsh domstate "$VMNAME" 2>/dev/null)
+        VCPUS=$(virsh dominfo "$VMNAME" 2>/dev/null | awk "/^CPU/{print \$2}")
+        RAM=$(virsh dominfo "$VMNAME" 2>/dev/null | awk "/^Max memory/{printf \"%.0f\", \$3/1024}")
+        NETS=$(virsh domiflist "$VMNAME" 2>/dev/null | awk "NR>2 && \$1!=\"\" {printf \"%s(%s) \", \$1, \$3}" | sed "s/ \$//")
+        [ -z "$NETS" ] && NETS="---"
+        SNAPS=$(virsh snapshot-list "$VMNAME" 2>/dev/null | awk "NR>2 && NF>0" | wc -l)
+        [ "$SNAPS" -gt 0 ] && SNAP_STR="${SNAPS} snap(s)" || SNAP_STR="ninguno"
+        printf "  %-30s %-12s %-6s %-10s %-25s %s\n" "$VMNAME" "$STATE" "$VCPUS" "$RAM" "$NETS" "$SNAP_STR"
+    done
+
+    echo ""
+
+    # --- VMs con snapshots ---
+    echo -e "  ${BOLD}VMs con snapshots activos:${NC}"
+    HAS_SNAPS=0
+    virsh list --all --name 2>/dev/null | grep -v "^$" | while read VM; do
+        COUNT=$(virsh snapshot-list "$VM" 2>/dev/null | awk "NR>2 && NF>0" | wc -l)
+        if [ "$COUNT" -gt 0 ]; then
+            HAS_SNAPS=1
+            warn "$VM — $COUNT snapshot(s)"
+            virsh snapshot-list "$VM" 2>/dev/null | awk "NR>2 && NF>0" | \
+                awk "{printf \"       %-30s %s %s\\n\", \$1, \$2, \$3}"
+        fi
+    done
+    [ "$HAS_SNAPS" -eq 0 ] 2>/dev/null && ok "Ninguna VM tiene snapshots activos"
+
+    echo ""
+
+    # --- VMs crashed o paused ---
+    PROBLEM_VMS=$(virsh list --all 2>/dev/null | awk "/paused|crashed/{print \$2, \$3}")
+    if [ -n "$PROBLEM_VMS" ]; then
+        crit "VMs en estado problematico (paused/crashed):"
+        echo "$PROBLEM_VMS" | while read l; do echo "     $l"; done
+    else
+        ok "Ninguna VM en estado paused o crashed"
+    fi
+
+    echo ""
+
+    # --- Redes virtuales ---
+    echo -e "  ${BOLD}Redes virtuales (virsh net-list):${NC}"
+    virsh net-list --all 2>/dev/null | grep -v "^$" | grep -v "^-" | \
+        awk "NR==1{printf \"  ${BOLD}%-20s %-12s %s${NC}\\n\",\$1,\$2,\$3} NR>1 && NF>0{printf \"  %-20s %-12s %s\\n\",\$1,\$2,\$3}"
+    echo ""
+    ok "Validacion de VMs completada"
+fi
+
 # -----------------------------------------------------------------------------
 section "ERRORES EN KERNEL (dmesg)"
 # -----------------------------------------------------------------------------
