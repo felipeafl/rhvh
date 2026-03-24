@@ -87,16 +87,17 @@ section "TOP $TOP_VMS VMs POR CPU"
 echo -e "  ${BOLD}%CPU   %MEM   PID      NOMBRE DE VM${NC}"
 echo "  $SEP"
 
+ps aux --sort=-%cpu | grep -w qemu-kvm | grep -v grep | head -$TOP_VMS | \
 while IFS= read -r line; do
     PID=$(echo "$line" | awk '{print $2}')
     CPU=$(echo "$line" | awk '{print $3}')
     MEM=$(echo "$line" | awk '{print $4}')
     if [ -f /proc/$PID/cmdline ]; then
-        VMNAME=$(cat /proc/$PID/cmdline 2>/dev/null | tr '\0' '\n' | grep "guest=" | sed 's/.*guest=//' | cut -d',' -f1)
+        VMNAME=$(tr '\0' '\n' < /proc/$PID/cmdline 2>/dev/null | grep "guest=" | sed 's/.*guest=//' | cut -d',' -f1)
         [ -z "$VMNAME" ] && VMNAME="(sin nombre)"
         printf "  %-6s %-6s %-8s %s\n" "$CPU" "$MEM" "$PID" "$VMNAME"
     fi
-done < <(ps aux --sort=-%cpu | grep qemu-kvm | grep -v grep | head -$TOP_VMS)
+done
 
 # -----------------------------------------------------------------------------
 section "TOP $TOP_VMS VMs POR MEMORIA"
@@ -104,16 +105,17 @@ section "TOP $TOP_VMS VMs POR MEMORIA"
 echo -e "  ${BOLD}%MEM   %CPU   PID      NOMBRE DE VM${NC}"
 echo "  $SEP"
 
+ps aux --sort=-%mem | grep -w qemu-kvm | grep -v grep | head -$TOP_VMS | \
 while IFS= read -r line; do
     PID=$(echo "$line" | awk '{print $2}')
     CPU=$(echo "$line" | awk '{print $3}')
     MEM=$(echo "$line" | awk '{print $4}')
     if [ -f /proc/$PID/cmdline ]; then
-        VMNAME=$(cat /proc/$PID/cmdline 2>/dev/null | tr '\0' '\n' | grep "guest=" | sed 's/.*guest=//' | cut -d',' -f1)
+        VMNAME=$(tr '\0' '\n' < /proc/$PID/cmdline 2>/dev/null | grep "guest=" | sed 's/.*guest=//' | cut -d',' -f1)
         [ -z "$VMNAME" ] && VMNAME="(sin nombre)"
         printf "  %-6s %-6s %-8s %s\n" "$MEM" "$CPU" "$PID" "$VMNAME"
     fi
-done < <(ps aux --sort=-%mem | grep qemu-kvm | grep -v grep | head -$TOP_VMS)
+done
 
 # -----------------------------------------------------------------------------
 section "I/O DE DISCOS (${IOSTAT_COUNT} muestras)"
@@ -138,13 +140,14 @@ section "ESTADO DEL CONTROLADOR MEGARAID"
 if [ ! -f "$STORCLI" ]; then
     warn "storcli64 no encontrado en $STORCLI"
 else
-    # VDs
+    # --- Virtual Drives ---
+    # FIX 1: solo líneas que empiezan con dígito (evita capturar el glosario)
     echo -e "  ${BOLD}Virtual Drives:${NC}"
-    $STORCLI $CTRL /vall show | grep -E "DG/VD|RAID|Optl|Pdgd|Dgrd|OfLn" | grep -v "^$"
+    VD_OUTPUT=$($STORCLI $CTRL /vall show)
+    echo "$VD_OUTPUT" | awk '/^[0-9]/{print "  "$0}'
     echo ""
 
-    # Revisar estado de VDs
-    DEGRADED=$($STORCLI $CTRL /vall show | grep -E "Pdgd|Dgrd|OfLn" | grep -v "^#")
+    DEGRADED=$(echo "$VD_OUTPUT" | awk '/^[0-9]/ && /Pdgd|Dgrd|OfLn/')
     if [ -n "$DEGRADED" ]; then
         crit "Hay Virtual Drives degradados o fuera de línea:"
         echo "$DEGRADED" | while read l; do echo "     $l"; done
@@ -152,15 +155,16 @@ else
         ok "Todos los Virtual Drives en estado Optimal"
     fi
 
-    # Discos físicos
+    # --- Discos físicos ---
+    # FIX 2: solo líneas que empiezan con dígito (evita capturar el glosario)
     echo ""
     echo -e "  ${BOLD}Discos físicos:${NC}"
-    $STORCLI $CTRL /eall /sall show | grep -E "^[0-9]"
+    PD_OUTPUT=$($STORCLI $CTRL /eall /sall show)
+    echo "$PD_OUTPUT" | awk '/^[0-9]/{print "  "$0}'
     echo ""
 
-    # Discos con estado problemático
-    BAD_PD=$($STORCLI $CTRL /eall /sall show | grep -E "Offln|UBad|Failed" | grep -v "^#")
-    RBLD_PD=$($STORCLI $CTRL /eall /sall show | grep "Rbld")
+    BAD_PD=$(echo "$PD_OUTPUT" | awk '/^[0-9]/ && /Offln|UBad|Failed/')
+    RBLD_PD=$(echo "$PD_OUTPUT" | awk '/^[0-9]/ && /Rbld/')
 
     if [ -n "$BAD_PD" ]; then
         crit "Discos físicos en estado crítico:"
@@ -169,36 +173,44 @@ else
         ok "Todos los discos físicos Online"
     fi
 
+    # --- Rebuild en progreso ---
     if [ -n "$RBLD_PD" ]; then
         warn "Disco(s) en proceso de rebuild:"
         echo "$RBLD_PD" | while read l; do echo "     $l"; done
         echo ""
 
-        # Progreso del rebuild
-        RBLD_SLOT=$(echo "$RBLD_PD" | awk '{print $1}' | head -1 | sed 's/:/\/e/' | sed 's/\//\/e/' )
-        EID=$(echo "$RBLD_PD" | awk '{print $1}' | head -1 | cut -d: -f1)
-        SLT=$(echo "$RBLD_PD" | awk '{print $1}' | head -1 | cut -d: -f2)
-        echo -e "  ${BOLD}Progreso rebuild e${EID}/s${SLT}:${NC}"
-        $STORCLI $CTRL/e${EID}/s${SLT} show rebuild 2>/dev/null || \
-            $STORCLI $CTRL/e${EID}/s${SLT} show all | grep -iE "rebuild|progress"
+        # FIX 3: extraer EID y Slot correctamente y validar que son números
+        FIRST_RBLD=$(echo "$RBLD_PD" | head -1)
+        EID=$(echo "$FIRST_RBLD" | awk '{print $1}' | cut -d: -f1)
+        SLT=$(echo "$FIRST_RBLD" | awk '{print $1}' | cut -d: -f2)
+
+        if [[ "$EID" =~ ^[0-9]+$ ]] && [[ "$SLT" =~ ^[0-9]+$ ]]; then
+            echo -e "  ${BOLD}Progreso rebuild e${EID}/s${SLT}:${NC}"
+            $STORCLI ${CTRL}/e${EID}/s${SLT} show rebuild 2>/dev/null | grep -E "Rebuild|Progress|%"
+        fi
     fi
 
-    # BBU
+    # --- BBU ---
     echo ""
     echo -e "  ${BOLD}Estado BBU/CacheVault:${NC}"
-    $STORCLI $CTRL show all | grep -E "BBU Status|BBU =|CacheVault|Write Policy|FW Cache" | grep -v "^#" | head -8
+    BBU_OUTPUT=$($STORCLI $CTRL show all)
+    echo "$BBU_OUTPUT" | grep -E "^BBU Status|^BBU =|^CacheVault Flash|^Write Policy|^Current Size of FW" | head -8
 
-    BBU_STATUS=$($STORCLI $CTRL show all | grep "BBU Status" | awk '{print $NF}')
+    BBU_STATUS=$(echo "$BBU_OUTPUT" | awk '/^BBU Status/{print $NF}')
     if [ "$BBU_STATUS" = "0" ]; then
         ok "BBU OK (Status=0)"
     else
         crit "BBU con problemas (Status=$BBU_STATUS) — verificar política de caché"
     fi
 
-    # Eventos recientes
+    # --- Eventos recientes ---
+    # FIX 4: filtrar solo líneas "Event Description:" para evitar capturar texto de ayuda
     echo ""
     echo -e "  ${BOLD}Eventos de warning recientes:${NC}"
-    EVENTS=$($STORCLI $CTRL show events type=warning 2>/dev/null | grep -E "Command timeout|reset|Unexpected sense|Offline" | tail -10)
+    EVENTS=$($STORCLI $CTRL show events type=warning 2>/dev/null | \
+        grep "Event Description:" | \
+        grep -iE "Command timeout|Unexpected sense|Offline|link speed changed" | \
+        tail -10)
     if [ -n "$EVENTS" ]; then
         crit "Eventos de warning detectados:"
         echo "$EVENTS" | while read l; do echo "     $l"; done
