@@ -228,58 +228,85 @@ section "ESTADO Y CONFIGURACION DE VMs"
 if ! command -v virsh &>/dev/null; then
     warn "virsh no disponible - omitiendo validacion de VMs"
 else
-    # --- Resumen de estados ---
+    # Una sola llamada a virsh list para evitar múltiples invocaciones lentas
+    VIRSH_ALL=$(virsh list --all 2>/dev/null)
+
+    # --- Resumen de estados (desde el mismo output) ---
     echo -e "  ${BOLD}Resumen de estados:${NC}"
-    TOTAL=$(virsh list --all 2>/dev/null | grep -cE "running|paused|shut off|crashed|pmsuspended")
-    RUNNING=$(virsh list --all 2>/dev/null | grep -c " running")
-    PAUSED=$(virsh list --all 2>/dev/null | grep -c " paused")
-    CRASHED=$(virsh list --all 2>/dev/null | grep -c " crashed")
-    SHUTOFF=$(virsh list --all 2>/dev/null | grep -c "shut off")
+    TOTAL=$(echo "$VIRSH_ALL"  | grep -cE "running|paused|shut off|crashed|pmsuspended")
+    RUNNING=$(echo "$VIRSH_ALL" | grep -c " running")
+    PAUSED=$(echo "$VIRSH_ALL"  | grep -c " paused")
+    CRASHED=$(echo "$VIRSH_ALL" | grep -c " crashed")
+    SHUTOFF=$(echo "$VIRSH_ALL" | grep -c "shut off")
 
     printf "  %-14s %s\n" "Total VMs:"  "$TOTAL"
     printf "  %-14s %s\n" "Running:"    "$RUNNING"
     printf "  %-14s %s\n" "Shut off:"   "$SHUTOFF"
-    [ "$PAUSED"  -gt 0 ] && printf "  ${YELLOW}WARNING${NC}  %-10s %s\n" "Paused:"  "$PAUSED"
-    [ "$CRASHED" -gt 0 ] && printf "  ${RED}CRITICAL${NC}  %-10s %s\n" "Crashed:" "$CRASHED"
+    [ "$PAUSED"  -gt 0 ] && warn "Paused:  $PAUSED VM(s)"
+    [ "$CRASHED" -gt 0 ] && crit "Crashed: $CRASHED VM(s)"
     echo ""
 
-    # --- Detalle por VM ---
+    # --- Detalle por VM usando virsh domstats (una sola llamada para todas las VMs) ---
+    # Para VMs running: obtenemos CPU y memoria de domstats (rápido, una sola llamada)
+    # Para VMs shut off: usamos dumpxml que es local y no requiere conexión al dominio
     echo -e "  ${BOLD}Detalle por VM:${NC}"
     printf "  ${BOLD}%-30s %-12s %-6s %-10s %-25s %s${NC}\n" \
         "NOMBRE" "ESTADO" "vCPUs" "RAM(MiB)" "RED(es)" "SNAPSHOTS"
-    printf "  %.0s-" {1..90}; echo ""
+    printf "  %0.s-" {1..95}; echo ""
 
-    virsh list --all --name 2>/dev/null | grep -v "^$" | while read VMNAME; do
-        STATE=$(virsh domstate "$VMNAME" 2>/dev/null)
-        VCPUS=$(virsh dominfo "$VMNAME" 2>/dev/null | awk "/^CPU/{print \$2}")
-        RAM=$(virsh dominfo "$VMNAME" 2>/dev/null | awk "/^Max memory/{printf \"%.0f\", \$3/1024}")
-        NETS=$(virsh domiflist "$VMNAME" 2>/dev/null | awk "NR>2 && \$1!=\"\" {printf \"%s(%s) \", \$1, \$3}" | sed "s/ \$//")
+    # Obtener lista de nombres con estado de una sola vez
+    VM_LIST=$(echo "$VIRSH_ALL" | awk 'NR>2 && NF>=3 {
+        id=$1; name=$2; state=""
+        for(i=3;i<=NF;i++) state=state" "$i
+        gsub(/^ /,"",state)
+        print name"|"state
+    }')
+
+    # Snapshot info: una sola llamada a snapshot-list --all (mucho más rápido)
+    # Formato: "vmname snapshotname"
+    SNAP_ALL=$(virsh snapshot-list --all 2>/dev/null | awk 'NR>2 && NF>0 {print $1}' | sort | uniq -c | awk '{print $2"|"$1}')
+
+    echo "$VM_LIST" | grep -v "^$" | while IFS='|' read VMNAME STATE; do
+        [ -z "$VMNAME" ] && continue
+
+        # CPU y RAM desde dumpxml (no requiere que la VM esté running, es muy rápido)
+        XML=$(virsh dumpxml "$VMNAME" 2>/dev/null)
+        VCPUS=$(echo "$XML" | grep -oP '(?<=<vcpu[^>]*>)\d+' | head -1)
+        RAM_KIB=$(echo "$XML" | grep -oP '(?<=<memory unit=.KiB.>)\d+' | head -1)
+        [ -n "$RAM_KIB" ] && RAM=$(( RAM_KIB / 1024 )) || RAM="?"
+
+        # Red desde dumpxml (sin llamada extra a virsh)
+        NETS=$(echo "$XML" | grep -oP "(?<=<source bridge=')[^']+" | \
+               awk '{printf "%s ", $0}' | sed 's/ $//')
+        [ -z "$NETS" ] && NETS=$(echo "$XML" | grep -oP "(?<=<source network=')[^']+" | \
+               awk '{printf "%s ", $0}' | sed 's/ $//')
         [ -z "$NETS" ] && NETS="---"
-        SNAPS=$(virsh snapshot-list "$VMNAME" 2>/dev/null | awk "NR>2 && NF>0" | wc -l)
-        [ "$SNAPS" -gt 0 ] && SNAP_STR="${SNAPS} snap(s)" || SNAP_STR="ninguno"
-        printf "  %-30s %-12s %-6s %-10s %-25s %s\n" "$VMNAME" "$STATE" "$VCPUS" "$RAM" "$NETS" "$SNAP_STR"
+
+        # Snapshots desde el listado pre-cargado
+        SNAPS=$(echo "$SNAP_ALL" | grep "^${VMNAME}|" | cut -d'|' -f2)
+        [ -z "$SNAPS" ] && SNAPS=0
+        [ "$SNAPS" -gt 0 ] && SNAP_STR="${YELLOW}${SNAPS} snap(s)${NC}" || SNAP_STR="ninguno"
+
+        printf "  %-30s %-12s %-6s %-10s %-25s " "$VMNAME" "$STATE" "${VCPUS:-?}" "${RAM}" "$NETS"
+        printf "%b\n" "$SNAP_STR"
     done
 
     echo ""
 
-    # --- VMs con snapshots ---
+    # --- VMs con snapshots (del listado pre-cargado) ---
     echo -e "  ${BOLD}VMs con snapshots activos:${NC}"
-    HAS_SNAPS=0
-    virsh list --all --name 2>/dev/null | grep -v "^$" | while read VM; do
-        COUNT=$(virsh snapshot-list "$VM" 2>/dev/null | awk "NR>2 && NF>0" | wc -l)
-        if [ "$COUNT" -gt 0 ]; then
-            HAS_SNAPS=1
+    if [ -n "$SNAP_ALL" ]; then
+        echo "$SNAP_ALL" | while IFS='|' read VM COUNT; do
             warn "$VM — $COUNT snapshot(s)"
-            virsh snapshot-list "$VM" 2>/dev/null | awk "NR>2 && NF>0" | \
-                awk "{printf \"       %-30s %s %s\\n\", \$1, \$2, \$3}"
-        fi
-    done
-    [ "$HAS_SNAPS" -eq 0 ] 2>/dev/null && ok "Ninguna VM tiene snapshots activos"
+        done
+    else
+        ok "Ninguna VM tiene snapshots activos"
+    fi
 
     echo ""
 
-    # --- VMs crashed o paused ---
-    PROBLEM_VMS=$(virsh list --all 2>/dev/null | awk "/paused|crashed/{print \$2, \$3}")
+    # --- VMs crashed o paused (del listado pre-cargado) ---
+    PROBLEM_VMS=$(echo "$VIRSH_ALL" | awk '/paused|crashed/{print $2, $3}')
     if [ -n "$PROBLEM_VMS" ]; then
         crit "VMs en estado problematico (paused/crashed):"
         echo "$PROBLEM_VMS" | while read l; do echo "     $l"; done
@@ -290,9 +317,11 @@ else
     echo ""
 
     # --- Redes virtuales ---
-    echo -e "  ${BOLD}Redes virtuales (virsh net-list):${NC}"
-    virsh net-list --all 2>/dev/null | grep -v "^$" | grep -v "^-" | \
-        awk "NR==1{printf \"  ${BOLD}%-20s %-12s %s${NC}\\n\",\$1,\$2,\$3} NR>1 && NF>0{printf \"  %-20s %-12s %s\\n\",\$1,\$2,\$3}"
+    echo -e "  ${BOLD}Redes virtuales:${NC}"
+    virsh net-list --all 2>/dev/null | awk '
+        NR==1 {printf "  \033[1m%-20s %-12s %s\033[0m\n", $1, $2, $3}
+        NR>2 && NF>0 {printf "  %-20s %-12s %s\n", $1, $2, $3}
+    '
     echo ""
     ok "Validacion de VMs completada"
 fi
