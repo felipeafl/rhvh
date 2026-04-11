@@ -99,27 +99,31 @@ function Test-LatenciaDetallada {
 
 function Get-Traceroute {
     param([string]$IP, [int]$MaxHops = 20)
-    $Hops = @()
-    # Usar tracert nativo de Windows y parsear su salida real
+    $Hops = [System.Collections.Generic.List[PSCustomObject]]::new()
     $Salida = & tracert -d -h $MaxHops -w 2000 $IP 2>&1
     foreach ($Linea in $Salida) {
         $L = $Linea.ToString().Trim()
-        # Linea tipica: "  1     6 ms     3 ms     4 ms  192.168.1.1"
-        # o con timeout: "  7     *        *        *     Tiempo de espera agotado"
-        if ($L -match '^\s*(\d+)\s+') {
-            $NumHop = [int]$Matches[1]
-            # Buscar IPs en la linea
-            $HopIP = ($L | Select-String -Pattern '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}' -AllMatches).Matches |
-                     Select-Object -Last 1 | ForEach-Object { $_.Value }
-            if (-not $HopIP) { $HopIP = "*" }
-            # Buscar tiempos en ms (numeros seguidos de " ms")
-            $Tiempos = ($L | Select-String -Pattern '(\d+)\s+ms' -AllMatches).Matches |
-                       ForEach-Object { [int]$_.Groups[1].Value }
-            $Ms = if ($Tiempos.Count -gt 0) {
-                [math]::Round(($Tiempos | Measure-Object -Average).Average, 0)
-            } else { $null }
-            $Hops += [PSCustomObject]@{ Hop = $NumHop; IP = $HopIP; Ms = $Ms }
+        if ($L -notmatch '^\s*(\d+)\s+') { continue }
+        $NumHop = [int]$Matches[1]
+
+        # Extraer IP con regex directo (evita Select-String que puede devolver null)
+        $HopIP = "*"
+        if ($L -match '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})') {
+            # Tomar la ultima IP de la linea
+            $AllIPs = [regex]::Matches($L, '\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+            if ($AllIPs.Count -gt 0) { $HopIP = $AllIPs[$AllIPs.Count - 1].Value }
         }
+
+        # Extraer tiempos con regex directo
+        $Ms = $null
+        $AllMs = [regex]::Matches($L, '(\d+)\s+ms')
+        if ($AllMs.Count -gt 0) {
+            $Suma = 0
+            foreach ($M in $AllMs) { $Suma += [int]$M.Groups[1].Value }
+            $Ms = [math]::Round($Suma / $AllMs.Count, 0)
+        }
+
+        $Hops.Add([PSCustomObject]@{ Hop = $NumHop; IP = $HopIP; Ms = $Ms })
     }
     return $Hops
 }
