@@ -78,8 +78,9 @@ fi
  
 # Extraer parámetros clave de configuración
 get_conf() {
-    # Corta solo en el PRIMER '=' para soportar passwords con '=' en el valor
-    grep -i "^$1" "$PROXY_CONF" 2>/dev/null | tail -1 | sed 's/^[^=]*=//' | sed 's/^[[:space:]]*//'
+    # Match exacto de la clave (seguido de '=' o espacios+'=')
+    # Soporta passwords con '=' en el valor (corta solo en el primer '=')
+    grep -iE "^$1[[:space:]]*=" "$PROXY_CONF" 2>/dev/null | tail -1 | sed 's/^[^=]*=//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//'
 }
  
 ZBX_SERVER=$(get_conf "Server")
@@ -261,10 +262,29 @@ info "Tipo de BD detectado: $DB_TYPE"
 case "$DB_TYPE" in
     mysql)
         info "Verificando MySQL/MariaDB..."
-        if systemctl is-active --quiet mysql 2>/dev/null || systemctl is-active --quiet mariadb 2>/dev/null; then
-            ok "Servicio MySQL/MariaDB activo"
+        # Detectar el nombre real del servicio (mysqld, mysql, mariadb, mariadb10...)
+        MYSQL_SVC=""
+        for SVC_CANDIDATE in mysqld mysql mariadb mariadb10 mysql80; do
+            if systemctl list-units --type=service 2>/dev/null | grep -q "^.*${SVC_CANDIDATE}.service"; then
+                MYSQL_SVC="$SVC_CANDIDATE"
+                break
+            fi
+        done
+ 
+        if [ -z "$MYSQL_SVC" ]; then
+            # Segundo intento: buscar el proceso mysqld directamente
+            if pgrep -x mysqld &>/dev/null || pgrep -x mysqld_safe &>/dev/null; then
+                ok "MySQL/MariaDB proceso activo (servicio systemd no detectado — puede ser instalación manual)"
+                MYSQL_SVC="proceso"
+            else
+                crit "Servicio MySQL/MariaDB INACTIVO — el proxy no puede escribir/leer datos"
+            fi
+        elif systemctl is-active --quiet "$MYSQL_SVC" 2>/dev/null; then
+            ok "Servicio ${MYSQL_SVC} ACTIVO"
+            MYSQL_VER=$(mysqladmin -u"${ZBX_DBUSER}" -p"${ZBX_DBPASS}" version 2>/dev/null | grep "Server version" | awk '{print $3}')
+            [ -n "$MYSQL_VER" ] && info "Versión: $MYSQL_VER"
         else
-            crit "Servicio MySQL/MariaDB INACTIVO — el proxy no puede escribir/leer datos"
+            crit "Servicio ${MYSQL_SVC} INACTIVO — el proxy no puede escribir/leer datos"
         fi
  
         # Tamaño de la BD del proxy
@@ -663,7 +683,7 @@ else
 fi
  
 # Errores de kernel relevantes (excluye mensajes normales de boot/systemd)
-KERNEL_ERRS=$(dmesg --since "24 hours ago" 2>/dev/null | grep -iE "error|panic|fault|oops|BUG|call trace|segfault" | grep -vE "systemd|NetLabel|pid_max|iommu|PCI: CLS|hostname|Queued start" | grep -v "^audit" | tail -10)
+KERNEL_ERRS=$(dmesg --since "24 hours ago" 2>/dev/null | grep -iE "error|panic|fault|oops|BUG:|call trace|segfault|kernel BUG|Unable to handle" | grep -vE "systemd|NetLabel|pid_max|iommu|PCI: CLS|hostname|Queued start|ACPI.*BIOS|host bridge|XFS with|_OSI|pci=nocrs|SGI XFS|firmware" | grep -v "^audit" | tail -10)
 [ -n "$KERNEL_ERRS" ] && { warn "Errores de kernel recientes:"; echo "$KERNEL_ERRS" | head -10 | while read -r l; do echo "    $l"; done; }
  
 # Journal del servicio
@@ -728,7 +748,7 @@ echo -e "  ${BOLD}Reporte guardado en:${NC} $REPORTE"
 echo -e "  ${BOLD}Log del proxy:${NC}       $ZBX_LOGFILE"
 echo ""
 echo -e "  ${BOLD}${CYAN}Comandos útiles para seguimiento:${NC}"
-echo "    tail -f $ZBX_LOGFILE"
+echo "    tail -f ${ZBX_LOGFILE:-/var/log/zabbix/zabbix_proxy.log}"
 echo "    watch -n 2 'ss -tn dst $ZBX_SERVER'"
 echo "    watch -n 5 'pgrep -c zabbix_proxy'"
 [ "$DB_TYPE" = "mysql" ] && echo "    mysql -u zabbix -e 'SELECT COUNT(*) FROM ${ZBX_DBNAME:-zabbix_proxy}.proxy_history'"
