@@ -226,25 +226,56 @@ while read NAME SIZE TYPE ROTA MODEL; do
         "/dev/$NAME" "$SIZE" "$DISK_TYPE" "$([ $ROTA -eq 0 ] && echo No || echo Si)" "$MODEL"
 done
  
-# Contar discos y capacidad total
-DISK_COUNT=$(lsblk -d -o NAME,TYPE 2>/dev/null | grep -v "loop\|sr\|NAME" | grep "disk" | wc -l)
-DISK_CAPACITY=$(lsblk -d -o SIZE,TYPE 2>/dev/null | grep "disk" | awk '{sum+=$1} END{print sum}' 2>/dev/null || \
-    lsblk -d -o SIZE,TYPE 2>/dev/null | grep "disk" | awk 'NR==1{print NR" × "$1}')
+# Contar discos físicos y capacidad total
+# Fuente primaria: storcli (discos físicos reales, no VDs)
+# Fallback: lsblk (solo si no hay RAID controller)
+DISK_COUNT=0
+SUMMARY_DISK_CAPACITY=""
+ 
+if [ -f "$STORCLI" ]; then
+    # storcli: parsear "EID:Slot State DG Size Intf Med Model"
+    # Columna Size tiene valor y unidad separados (ej: "1.818 TB" o "446.625 GB")
+    STORCLI_DISKS=$($STORCLI /c0 /eall /sall show 2>/dev/null | awk '/^[0-9]+:[0-9]+/{print}')
+    DISK_COUNT=$(echo "$STORCLI_DISKS" | grep -c "." 2>/dev/null || echo 0)
+ 
+    # Sumar capacidad total en GB usando awk
+    TOTAL_GB=$(echo "$STORCLI_DISKS" | awk '
+    {
+        val=$5; unit=$6
+        if (unit == "TB") val = val * 1024
+        # unit == "GB" ya está en GB
+        total += val
+    }
+    END { printf "%.0f", total }')
+ 
+    if [ "${TOTAL_GB:-0}" -gt 0 ] 2>/dev/null; then
+        if [ "$TOTAL_GB" -ge 1024 ] 2>/dev/null; then
+            CAP_HUMAN=$(awk "BEGIN {printf \"%.1f TB\", $TOTAL_GB/1024}")
+        else
+            CAP_HUMAN="${TOTAL_GB} GB"
+        fi
+        SUMMARY_DISK_CAPACITY="${CAP_HUMAN} (${DISK_COUNT} disco(s) físico(s) vía storcli)"
+    else
+        SUMMARY_DISK_CAPACITY="${DISK_COUNT} disco(s) físico(s) (capacidad N/D)"
+    fi
+else
+    # Fallback: lsblk — puede mostrar VDs en entornos RAID
+    warn "storcli no disponible — usando lsblk (puede mostrar discos virtuales)"
+    DISK_COUNT=$(lsblk -d -o NAME,TYPE 2>/dev/null | grep -v "loop\|sr\|NAME" | grep "disk" | wc -l)
+    DISK_SIZES=$(lsblk -d -b -o SIZE,TYPE 2>/dev/null | grep "disk" | awk '{print $1}')
+    TOTAL_BYTES=0
+    while read -r sz; do
+        [ -n "$sz" ] && TOTAL_BYTES=$(( TOTAL_BYTES + sz ))
+    done <<< "$DISK_SIZES"
+    if [ "$TOTAL_BYTES" -gt 0 ] 2>/dev/null; then
+        TOTAL_HUMAN=$(numfmt --to=iec-i --suffix=B "$TOTAL_BYTES" 2>/dev/null || echo "${TOTAL_BYTES} bytes")
+        SUMMARY_DISK_CAPACITY="${TOTAL_HUMAN} (${DISK_COUNT} dispositivo(s) vía lsblk — verificar si son VDs)"
+    else
+        SUMMARY_DISK_CAPACITY="Ver detalle arriba"
+    fi
+fi
  
 SUMMARY_DISK_COUNT="$DISK_COUNT"
- 
-# Para capacidad: intentar sumar con numfmt
-DISK_SIZES=$(lsblk -d -b -o SIZE,TYPE 2>/dev/null | grep "disk" | awk '{print $1}')
-TOTAL_BYTES=0
-while read -r sz; do
-    TOTAL_BYTES=$(( TOTAL_BYTES + sz ))
-done <<< "$DISK_SIZES"
-if [ "$TOTAL_BYTES" -gt 0 ] 2>/dev/null; then
-    TOTAL_HUMAN=$(numfmt --to=iec-i --suffix=B "$TOTAL_BYTES" 2>/dev/null || echo "${TOTAL_BYTES} bytes")
-    SUMMARY_DISK_CAPACITY="$TOTAL_HUMAN (${DISK_COUNT} disco(s))"
-else
-    SUMMARY_DISK_CAPACITY="Ver detalle arriba"
-fi
  
 # MegaRAID si disponible
 SMART_STATUS="OK"
