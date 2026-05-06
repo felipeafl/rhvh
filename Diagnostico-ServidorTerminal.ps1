@@ -2,7 +2,8 @@
 #  DIAGNOSTICO DE SERVIDOR TERMINAL - FUGAS DE MEMORIA Y CPU
 #  Uso: .\Diagnostico-ServidorTerminal.ps1
 #  Ejecutar como Administrador
-#  Compatible: Windows Server 2012 R2+ / PowerShell 4+
+#  Compatible: Windows Server 2012 R2+ / PowerShell 5+
+#  Version: 2.0 - Optimizado (.NET + CIM selectivo)
 # ============================================================
 
 #region CONFIGURACION
@@ -74,8 +75,8 @@ try {
     $CS  = Get-WmiObject Win32_ComputerSystem
     $CPU = Get-WmiObject Win32_Processor | Select-Object -First 1
 
-    $BootTime  = $OS.ConvertToDateTime($OS.LastBootUpTime)
-    $Uptime    = (Get-Date) - $BootTime
+    $BootTime   = $OS.ConvertToDateTime($OS.LastBootUpTime)
+    $Uptime     = (Get-Date) - $BootTime
     $UptimeDias = [math]::Floor($Uptime.TotalDays)
     $UptimeStr  = "$($Uptime.Days)d $($Uptime.Hours)h $($Uptime.Minutes)m"
 
@@ -143,11 +144,11 @@ Add-R ""
 Add-R "[3. ESTADO DE RAM]"
 
 try {
-    $OS2          = Get-WmiObject Win32_OperatingSystem
-    $TotalRAM_MB  = [math]::Round($OS2.TotalVisibleMemorySize / 1024, 0)
-    $LibreRAM_MB  = [math]::Round($OS2.FreePhysicalMemory / 1024, 0)
-    $UsadaRAM_MB  = $TotalRAM_MB - $LibreRAM_MB
-    $PctUsada     = [math]::Round(($UsadaRAM_MB / $TotalRAM_MB) * 100, 1)
+    $OS2         = Get-WmiObject Win32_OperatingSystem
+    $TotalRAM_MB = [math]::Round($OS2.TotalVisibleMemorySize / 1024, 0)
+    $LibreRAM_MB = [math]::Round($OS2.FreePhysicalMemory / 1024, 0)
+    $UsadaRAM_MB = $TotalRAM_MB - $LibreRAM_MB
+    $PctUsada    = [math]::Round(($UsadaRAM_MB / $TotalRAM_MB) * 100, 1)
 
     $EstadoRAM = if ($PctUsada -ge 90) { "CRITICO" } elseif ($PctUsada -ge 75) { "ADVERTENCIA" } else { "OK" }
     $ColorRAM  = Get-ColorEstado $EstadoRAM
@@ -156,11 +157,11 @@ try {
     $BarraVaciaR = 20 - $BarraLlenaR
     $BarraR      = "[" + ("X" * $BarraLlenaR) + ("-" * $BarraVaciaR) + "]"
 
-    Write-Host "  RAM Total    : $TotalRAM_MB MB"                     -ForegroundColor White
-    Write-Host "  RAM Usada    : $UsadaRAM_MB MB (${PctUsada}%)"        -ForegroundColor $ColorRAM
-    Write-Host "  RAM Libre    : $LibreRAM_MB MB"                     -ForegroundColor $ColorRAM
-    Write-Host "  Uso visual   : $BarraR ${PctUsada}%"                  -ForegroundColor $ColorRAM
-    Write-Host "  Estado       : $EstadoRAM"                          -ForegroundColor $ColorRAM
+    Write-Host "  RAM Total    : $TotalRAM_MB MB"                -ForegroundColor White
+    Write-Host "  RAM Usada    : $UsadaRAM_MB MB (${PctUsada}%)" -ForegroundColor $ColorRAM
+    Write-Host "  RAM Libre    : $LibreRAM_MB MB"                -ForegroundColor $ColorRAM
+    Write-Host "  Uso visual   : $BarraR ${PctUsada}%"           -ForegroundColor $ColorRAM
+    Write-Host "  Estado       : $EstadoRAM"                     -ForegroundColor $ColorRAM
     Add-R "  RAM: $UsadaRAM_MB MB / $TotalRAM_MB MB (${PctUsada}%) - Estado: $EstadoRAM"
 
     $PageFiles = Get-WmiObject Win32_PageFileUsage -ErrorAction SilentlyContinue
@@ -168,12 +169,13 @@ try {
         $PFTotal = ($PageFiles | Measure-Object AllocatedBaseSize -Sum).Sum
         $PFUsada = ($PageFiles | Measure-Object CurrentUsage -Sum).Sum
         $PFPeak  = ($PageFiles | Measure-Object PeakUsage -Sum).Sum
-        $ColorPF = if ($PFUsada -gt ($PFTotal * 0.7)) { "Yellow" } else { "White" }
-        $ColorPeak = if ($PFPeak -gt ($PFTotal * 0.9)) { "Red" } else { "White" }
+        $ColorPF   = if ($PFUsada -gt ($PFTotal * 0.7)) { "Yellow" } else { "White" }
+        $ColorPeak = if ($PFPeak  -gt ($PFTotal * 0.9)) { "Red" }    else { "White" }
+
         Write-Host ""
-        Write-Host "  PageFile Total : $PFTotal MB"            -ForegroundColor White
-        Write-Host "  PageFile En uso: $PFUsada MB"            -ForegroundColor $ColorPF
-        Write-Host "  PageFile Pico  : $PFPeak MB"             -ForegroundColor $ColorPeak
+        Write-Host "  PageFile Total : $PFTotal MB" -ForegroundColor White
+        Write-Host "  PageFile En uso: $PFUsada MB" -ForegroundColor $ColorPF
+        Write-Host "  PageFile Pico  : $PFPeak MB"  -ForegroundColor $ColorPeak
         Add-R "  PageFile: $PFUsada MB / $PFTotal MB (pico: $PFPeak MB)"
 
         if ($PFTotal -gt 0) {
@@ -247,46 +249,61 @@ try {
 }
 
 # ============================================================
-# SECCION 5: ANALISIS DE MEMORIA POR PROCESO
+# SECCION 5: ANALISIS DE MEMORIA POR PROCESO (OPTIMIZADO v2)
+# Fuente: Get-Process (.NET directo) + CIM selectivo solo para procesos
+# que superan algun umbral. Evita el loop WMI sobre todos los procesos.
 # ============================================================
 Write-Header "5. ANALISIS DE MEMORIA POR PROCESO"
 Add-R ""
 Add-R "[5. MEMORIA POR PROCESO]"
+Write-Host "  Recopilando datos mediante .NET + CIM selectivo..." -ForegroundColor Gray
 
-Write-Host "  Recopilando datos de procesos (fuente unica WMI)..." -ForegroundColor Gray
+# Get-Process (.NET) es ordenes de magnitud mas rapido que Get-WmiObject Win32_Process
+$ProcesosRaw = Get-Process -ErrorAction SilentlyContinue |
+               Select-Object Name, Id, WorkingSet64, PrivateMemorySize64, VirtualMemorySize64,
+                             HandleCount,
+                             @{Name='ThreadCount'; Expression={$_.Threads.Count}},
+                             StartTime
 
-# Una sola consulta WMI con todos los campos necesarios - sin loops secundarios
-$WMIProcs = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue
-$OwnerMap  = @{}
-foreach ($W in $WMIProcs) {
-    $Owner = "SYSTEM"
-    try { $o = $W.GetOwner(); if ($o.User) { $Owner = $o.User } } catch { }
-    $OwnerMap[[int]$W.ProcessId] = $Owner
-}
-
-# Usar List para evitar el costo de += que recrea el array en cada iteracion
 $ProcMemoria = [System.Collections.Generic.List[PSCustomObject]]::new()
 
-foreach ($W in $WMIProcs) {
-    if ($W.ProcessId -eq 0) { continue }
-    $StartStr = "N/A"
-    if ($W.CreationDate) {
-        try { $StartStr = $W.ConvertToDateTime($W.CreationDate).ToString("dd/MM HH:mm") } catch { }
+foreach ($P in $ProcesosRaw) {
+    if ($null -eq $P.Id -or $P.Id -eq 0) { continue }
+
+    # Determina si el proceso supera algún umbral para justificar consulta CIM del owner
+    $EsRelevante = ($P.PrivateMemorySize64 / 1MB) -ge $UmbralRAM_MB -or
+                   $P.HandleCount -ge $UmbralHandles -or
+                   $P.ThreadCount -ge $UmbralThreads
+
+    $Owner = "N/A"
+    if ($EsRelevante) {
+        try {
+            $CimProc = Get-CimInstance Win32_Process -Filter "ProcessId = $($P.Id)" -ErrorAction SilentlyContinue
+            if ($CimProc) {
+                $OwnerResult = Invoke-CimMethod -InputObject $CimProc -MethodName GetOwner -ErrorAction SilentlyContinue
+                $Owner = if ($OwnerResult.User) { $OwnerResult.User } else { "SYSTEM" }
+            }
+        } catch { $Owner = "Access Denied" }
     }
-    $Owner = if ($OwnerMap.ContainsKey([int]$W.ProcessId)) { $OwnerMap[[int]$W.ProcessId] } else { "SYSTEM" }
+
+    # StartTime puede lanzar excepcion en procesos de sistema protegidos
+    $StartStr = "N/A"
+    if ($P.StartTime) {
+        try { $StartStr = $P.StartTime.ToString("dd/MM HH:mm") } catch {}
+    }
+
     $ProcMemoria.Add([PSCustomObject]@{
-        Proceso        = $W.Name.Replace('.exe', '').Replace('.EXE', '')
-        PID            = [int]$W.ProcessId
-        RAM_MB         = [math]::Round($W.WorkingSetSize / 1MB, 1)
-        RAM_Privada_MB = [math]::Round($W.PrivatePageCount / 1MB, 1)
-        RAM_Virtual_MB = [math]::Round($W.VirtualSize / 1MB, 1)
-        Handles        = [int]$W.HandleCount
-        Threads        = [int]$W.ThreadCount
+        Proceso        = $P.Name
+        PID            = [int]$P.Id
+        RAM_MB         = [math]::Round($P.WorkingSet64        / 1MB, 1)
+        RAM_Privada_MB = [math]::Round($P.PrivateMemorySize64 / 1MB, 1)
+        RAM_Virtual_MB = [math]::Round($P.VirtualMemorySize64 / 1MB, 1)
+        Handles        = [int]$P.HandleCount
+        Threads        = [int]$P.ThreadCount
         Inicio         = $StartStr
         Propietario    = $Owner
     })
 }
-
 
 $TopRAM = $ProcMemoria | Sort-Object RAM_Privada_MB -Descending | Select-Object -First $TopProcesos
 
@@ -296,7 +313,7 @@ Write-Host ("  {0,-35}  {1,6}  {2,10}  {3,10}  {4,8}  {5,7}  {6,12}  {7,-12}" -f
 Write-Host "  $('-' * 100)" -ForegroundColor Gray
 
 foreach ($P in $TopRAM) {
-    $AlertaRAM    = if ($P.RAM_MB         -ge $UmbralRAM_MB)  { " [RAM!]"     } else { "" }
+    $AlertaRAM    = if ($P.RAM_Privada_MB -ge $UmbralRAM_MB)  { " [RAM!]"     } else { "" }
     $AlertaHandle = if ($P.Handles        -ge $UmbralHandles) { " [HANDLES!]" } else { "" }
     $AlertaThread = if ($P.Threads        -ge $UmbralThreads) { " [THREADS!]" } else { "" }
     $Alertas      = "$AlertaRAM$AlertaHandle$AlertaThread"
@@ -403,7 +420,7 @@ try {
         Write-Host ("  {0,-20}  {1,-10}  {2,-10}  {3}" -f "Fecha/Hora", "Tipo", "EventID", "Fuente / Mensaje") -ForegroundColor Gray
         Write-Host "  $('-' * 85)" -ForegroundColor Gray
         foreach ($E in $Eventos) {
-            $Color = if ($E.EntryType -eq "Error") { "Red" } else { "Yellow" }
+            $Color  = if ($E.EntryType -eq "Error") { "Red" } else { "Yellow" }
             $MsgRaw = $E.Message -replace "`n", " " -replace "`r", ""
             $Msg    = if ($MsgRaw.Length -gt 55) { $MsgRaw.Substring(0, 55) + "..." } else { $MsgRaw }
             $Linea  = "  {0,-20}  {1,-10}  {2,-10}  {3}: {4}" -f `
@@ -469,6 +486,9 @@ if ($Hallazgos.Count -eq 0) {
     Write-Host "  Revise las secciones marcadas con [!] en el reporte." -ForegroundColor Yellow
 }
 
+# ============================================================
+# GUARDAR REPORTE Y TIEMPO TOTAL
+# ============================================================
 try {
     $Reporte | Out-File -FilePath $ReportePath -Encoding UTF8
     Write-Host ""
