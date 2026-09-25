@@ -16,6 +16,11 @@
 #   ./upgrade_zabbix_proxy_74.sh --with-agent       Actualiza también zabbix-agent / zabbix-agent2 si están instalados
 #   ./upgrade_zabbix_proxy_74.sh --rollback DIR     Vuelve a la versión anterior usando el respaldo DIR
 #
+# Desde GitHub, sin descargar (los argumentos van después de "bash -s --"):
+#   curl -fsSL https://raw.githubusercontent.com/felipeafl/rhvh/main/upgrade_zabbix_proxy_74.sh | bash -s -- --check
+#   curl -fsSL https://raw.githubusercontent.com/felipeafl/rhvh/main/upgrade_zabbix_proxy_74.sh | bash
+#   (la confirmación se lee de la terminal; el respaldo guarda una copia local del script para el rollback)
+#
 # Configuración:
 #   - Se conserva tal cual: zabbix_proxy.conf (Server, Hostname, ProxyMode, TLS, Start*, buffers, etc.),
 #     los archivos de Include=, los PSK/certificados TLS (aunque estén fuera de /etc/zabbix) y los
@@ -48,8 +53,12 @@ ASSUME_YES=0
 WITH_AGENT=0
 ROLLBACK_DIR=""
 
+# Copia publicada del script (se usa para dejar una copia local en el respaldo cuando se corre con curl | bash)
+SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/felipeafl/rhvh/main/upgrade_zabbix_proxy_74.sh}"
+
 TS="$(date +%Y%m%d_%H%M%S)"
 RUN_LOG="/var/log/zabbix_proxy_upgrade_${TS}.log"
+SELF=""; [[ -f "$0" ]] && SELF="$(readlink -f "$0")"   # vacío cuando se ejecuta con curl | bash
 
 # ---------------------------------------------------------------------------- utilidades
 
@@ -57,9 +66,17 @@ log()  { printf '%s [INFO]  %s\n' "$(date '+%F %T')" "$*" | tee -a "$RUN_LOG"; }
 warn() { printf '%s [WARN]  %s\n' "$(date '+%F %T')" "$*" | tee -a "$RUN_LOG" >&2; }
 err()  { printf '%s [ERROR] %s\n' "$(date '+%F %T')" "$*" | tee -a "$RUN_LOG" >&2; }
 die_pre()  { err "$*"; err "No se hizo ningún cambio en el sistema."; exit 1; }
-die_post() { err "$*"; err "Revisar el log: $RUN_LOG"; [[ -n "${BACKUP_DIR:-}" ]] && err "Rollback: $0 --rollback $BACKUP_DIR"; exit 2; }
+die_post() {
+    err "$*"; err "Revisar el log: $RUN_LOG"
+    [[ -n "${BACKUP_DIR:-}" ]] && err "Rollback: bash $BACKUP_DIR/upgrade_zabbix_proxy_74.sh --rollback $BACKUP_DIR"
+    exit 2
+}
 
-usage() { sed -n '2,/^set -E/p' "$0" | grep '^#' | sed 's/^# \{0,1\}//'; exit 0; }
+usage() {
+    if [[ -n "$SELF" ]]; then sed -n '2,/^set -E/p' "$SELF" | grep '^#' | sed 's/^# \{0,1\}//'
+    else echo "Uso: curl -fsSL $SCRIPT_URL | bash -s -- [--check | --yes | --with-agent | --rollback DIR]"; fi
+    exit 0
+}
 
 include_files() {  # archivos referenciados por Include= (admite directorios y comodines)
     local inc f
@@ -107,7 +124,13 @@ proxy_version() { zabbix_proxy -V 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9
 
 confirm() {
     (( ASSUME_YES )) && return 0
-    read -r -p "$1 [si/NO]: " ans
+    # La respuesta se lee de la terminal, no de stdin: con "curl ... | bash" stdin es el propio script.
+    if ! { exec 3</dev/tty; } 2>/dev/null; then
+        err "No hay terminal para confirmar. Usar --yes, o descargar el script y ejecutarlo desde un archivo."
+        exit 3
+    fi
+    read -r -u 3 -p "$1 [si/NO]: " ans
+    exec 3<&-
     [[ "${ans,,}" == "si" || "${ans,,}" == "s" || "${ans,,}" == "yes" || "${ans,,}" == "y" ]] || { warn "Cancelado por el usuario."; exit 3; }
 }
 
@@ -270,7 +293,14 @@ config_snapshot "$BACKUP_DIR/config.before"
 effective_conf > "$BACKUP_DIR/effective.before"
 cp -a /etc/yum.repos.d/zabbix*.repo "$BACKUP_DIR/" 2>/dev/null || true
 rpm -qa 'zabbix*' | sort > "$BACKUP_DIR/rpms.before"
-cp "$0" "$BACKUP_DIR/" 2>/dev/null || true
+# Copia local del script en el respaldo, para poder hacer rollback aunque se haya ejecutado con curl | bash
+if [[ -n "$SELF" ]]; then
+    cp "$SELF" "$BACKUP_DIR/upgrade_zabbix_proxy_74.sh"
+else
+    curl -fsSL --max-time 30 "$SCRIPT_URL" -o "$BACKUP_DIR/upgrade_zabbix_proxy_74.sh" \
+        || warn "No se pudo guardar una copia del script en el respaldo ($SCRIPT_URL)."
+fi
+chmod 700 "$BACKUP_DIR/upgrade_zabbix_proxy_74.sh" 2>/dev/null || true
 log "Respaldo en $BACKUP_DIR (/etc/zabbix + ${#CFG_FILES[@]} archivos de configuración con su huella)"
 
 # ---------------------------------------------------------------------------- 3. repositorio y descarga anticipada
