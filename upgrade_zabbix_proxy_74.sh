@@ -38,7 +38,12 @@
 # Códigos de salida: 0 OK · 1 error en verificaciones previas (sin cambios) · 2 error durante/después
 # de la actualización (revisar y, si hace falta, usar --rollback) · 3 cancelado por el usuario.
 
+# Todo el script va dentro de main(), que se llama en la última línea: así bash lo lee completo
+# antes de ejecutar nada. Con "curl ... | bash", un comando que leyera stdin (dnf, rpm, systemctl)
+# podría tragarse el resto del script y cortarlo a mitad de la actualización.
+main() {
 set -Eeuo pipefail
+exec 0</dev/null   # ningún comando hijo lee stdin; la confirmación se pide por /dev/tty
 
 TARGET_MAJOR="7.4"
 RELEASE_RPM_URL="https://repo.zabbix.com/zabbix/${TARGET_MAJOR}/release/centos/9/noarch/zabbix-release-latest-${TARGET_MAJOR}.el9.noarch.rpm"
@@ -401,3 +406,6 @@ fi
 
 log "=== OK: '$PROXY_HOSTNAME' actualizado de $CURRENT a $NEW | respaldo $BACKUP_DIR | log $RUN_LOG"
 exit 0
+}
+
+main "$@"
