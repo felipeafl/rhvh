@@ -276,6 +276,18 @@ log "Espacio en disco: OK"
 curl -sfI --max-time 20 "$REPO_CHECK_URL" >/dev/null || die_pre "Sin acceso al repositorio $REPO_CHECK_URL"
 log "Acceso al repositorio de Zabbix: OK"
 
+# Herramientas que usa el script. Las imágenes mínimas de CentOS 9 suelen no traer tar ni diffutils.
+MISSING_PKGS=()
+for pair in tar:tar gzip:gzip diff:diffutils find:findutils sha256sum:coreutils stat:coreutils runuser:util-linux; do
+    command -v "${pair%%:*}" >/dev/null 2>&1 || MISSING_PKGS+=("${pair#*:}")
+done
+mapfile -t MISSING_PKGS < <(printf '%s\n' "${MISSING_PKGS[@]}" | sort -u | grep -v '^$' || true)
+if (( ${#MISSING_PKGS[@]} )); then
+    log "Faltan herramientas: se instalarán desde los repositorios de CentOS antes del respaldo: ${MISSING_PKGS[*]}"
+else
+    log "Herramientas necesarias: OK"
+fi
+
 # Paquetes a actualizar: los del proxy + utilidades de Zabbix instaladas (+ agentes si se pidió)
 UPGRADE_PKGS=("${PROXY_PKGS[@]}")
 for p in zabbix-selinux-policy zabbix-get zabbix-sender zabbix-js; do
@@ -304,6 +316,15 @@ fi
 confirm "Se actualizará '$PROXY_HOSTNAME' de $CURRENT a ${TARGET_MAJOR}. ¿Continuar?"
 
 # ---------------------------------------------------------------------------- 2. respaldo (con el proxy corriendo)
+
+if (( ${#MISSING_PKGS[@]} )); then
+    log "Instalando herramientas faltantes: ${MISSING_PKGS[*]} (no afecta al proxy)"
+    dnf -y install "${MISSING_PKGS[@]}" 2>&1 | tail -3 | tee -a "$RUN_LOG" || true
+    for pair in tar:tar gzip:gzip diff:diffutils find:findutils sha256sum:coreutils stat:coreutils runuser:util-linux; do
+        command -v "${pair%%:*}" >/dev/null 2>&1 || die_pre "No se pudo instalar '${pair%%:*}' (paquete ${pair#*:}). Instalarlo a mano y reintentar."
+    done
+    log "Herramientas instaladas."
+fi
 
 BACKUP_DIR="/root/pre74_proxy_${TS}"
 mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
