@@ -77,6 +77,23 @@ die_post() {
     exit 2
 }
 
+# Ningún error termina el script en silencio: se informa la línea, el comando y en qué estado quedó el proxy.
+on_error() {
+    local rc=$1 line=$2 cmd=$3
+    # Dentro de $(...) o <(...) un fallo puede ser esperado (grep sin coincidencias): no es un error del script.
+    (( BASH_SUBSHELL > 0 )) && return "$rc"
+    trap - ERR
+    err "Falló un comando (rc=$rc, línea $line): $cmd"
+    if (( ! ${CHANGED:-0} )); then
+        err "Ocurrió antes de modificar el proxy: no se hizo ningún cambio (sigue en su versión y funcionando)."
+    else
+        err "Revisar el log: $RUN_LOG"
+        err "Rollback: bash $BACKUP_DIR/upgrade_zabbix_proxy_74.sh --rollback $BACKUP_DIR"
+    fi
+    exit "$rc"
+}
+trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
+
 usage() {
     if [[ -n "$SELF" ]]; then sed -n '2,/^set -E/p' "$SELF" | grep '^#' | sed 's/^# \{0,1\}//'
     else echo "Uso: curl -fsSL $SCRIPT_URL | bash -s -- [--check | --yes | --with-agent | --rollback DIR]"; fi
@@ -290,10 +307,20 @@ confirm "Se actualizará '$PROXY_HOSTNAME' de $CURRENT a ${TARGET_MAJOR}. ¿Cont
 
 BACKUP_DIR="/root/pre74_proxy_${TS}"
 mkdir -p "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
-tar czf "$BACKUP_DIR/etc_zabbix.tgz" -C / etc/zabbix 2>>"$RUN_LOG"
+backup_tar() {  # backup_tar <destino.tgz> <args de tar...> — rc 1 de tar ("archivo cambió al leerlo") es solo aviso
+    local dest=$1 rc=0; shift
+    tar czpf "$dest" "$@" 2>"$dest.err" || rc=$?
+    cat "$dest.err" >> "$RUN_LOG"
+    if (( rc == 1 )); then
+        warn "tar avisó durante el respaldo $(basename "$dest") (se continúa): $(head -3 "$dest.err" | tr '\n' ' ')"
+    elif (( rc > 1 )); then
+        die_pre "No se pudo crear el respaldo $(basename "$dest") (tar rc=$rc): $(head -5 "$dest.err" | tr '\n' ' ')"
+    fi
+    rm -f "$dest.err"
+}
+backup_tar "$BACKUP_DIR/etc_zabbix.tgz" -C / etc/zabbix
 printf '%s\n' "${CFG_FILES[@]}" | sed 's|^/||' > "$BACKUP_DIR/config_files.list"
-tar czpf "$BACKUP_DIR/config_files.tgz" -C / --files-from="$BACKUP_DIR/config_files.list" 2>>"$RUN_LOG" \
-    || die_post "No se pudo respaldar la configuración (no se tocó el proxy)."
+backup_tar "$BACKUP_DIR/config_files.tgz" -C / --files-from="$BACKUP_DIR/config_files.list"
 config_snapshot "$BACKUP_DIR/config.before"
 effective_conf > "$BACKUP_DIR/effective.before"
 cp -a /etc/yum.repos.d/zabbix*.repo "$BACKUP_DIR/" 2>/dev/null || true
@@ -310,6 +337,7 @@ log "Respaldo en $BACKUP_DIR (/etc/zabbix + ${#CFG_FILES[@]} archivos de configu
 
 # ---------------------------------------------------------------------------- 3. repositorio y descarga anticipada
 
+CHANGED=1   # desde aquí el sistema ya se modifica (repositorio, paquetes, servicio)
 log "Cambiando repositorio a ${TARGET_MAJOR}"
 rpm -Uvh "$RELEASE_RPM_URL" 2>&1 | tee -a "$RUN_LOG" || rpm -q "zabbix-release" | grep -q "${TARGET_MAJOR}" \
     || die_post "No se pudo instalar zabbix-release ${TARGET_MAJOR} (no se tocó el proxy; el repositorio puede haber quedado a medias)."
