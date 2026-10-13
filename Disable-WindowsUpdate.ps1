@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Deshabilita descarga e instalación de Windows Updates de forma persistente.
 
